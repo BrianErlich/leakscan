@@ -1,0 +1,7 @@
+# One regex per line. Lines starting with # are comments.
+# Copy to ~/.config/leakscan/extra.txt (or point LEAKSCAN_EXTRA at a file) and add
+# what is private to you: project code names, internal hostnames, a home path.
+# Hits are reported as extra:<line number>, so the pattern itself is never printed.
+#
+# Project[Zz]ed
+# \binternal-wiki\.example\.com\b

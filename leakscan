@@ -1,0 +1,194 @@
+#!/usr/bin/env -S python3 -I
+"""leakscan: pattern check for files about to leave your machine.
+
+Exit 0 = no hits, 1 = hits (or an unscannable binary file), 2 = usage/read error.
+It only pattern-matches the text of the files it is given. It is a check that
+must pass alongside a human-style read, not a guarantee.
+"""
+import ipaddress
+import os
+import re
+import sys
+
+MAX_BYTES = 20 * 1024 * 1024
+ALLOW = "leakscan:allow"
+
+_PLACEHOLDER = re.compile(
+    r"^(?:[xX*.#_-]+|<.*>|\$\{?.*|\{\{.*|%.*%?|your[_-].*|.*(?:changeme|change_me|example|"
+    r"placeholder|redacted|dummy|sample|fake|todo|secret_here|xxxx).*|"
+    r"none|null|nil|true|false|undefined|password|secret|token|apikey|api_key)[\"',;)\]}]*$",
+    re.I,
+)
+
+
+def _generic_value_ok(v):
+    return not _PLACEHOLDER.match(v)
+
+
+def _net_filter(*nets):
+    nets = [ipaddress.ip_network(n) for n in nets]
+
+    def f(m):
+        try:
+            ip = ipaddress.IPv4Address(m.group(0))
+        except ValueError:
+            return False
+        return any(ip in n for n in nets)
+
+    return f
+
+
+def _ula_ok(m):
+    try:
+        ip = ipaddress.IPv6Address(m.group(0))
+    except ValueError:
+        return False
+    return ip in ipaddress.ip_network("fc00::/7")
+
+
+IPV4 = r"(?<![\d.])(?:\d{1,3}\.){3}\d{1,3}(?![\d]|\.\d)"
+
+# (name, description, regex, flags, group-to-mask or None, filter or None)
+PATTERNS = [
+    ("private-key-block", "PEM private key header", r"-----BEGIN [A-Z0-9 ]*PRIVATE KEY(?: BLOCK)?-----", 0, None, None),
+    ("ssh-public-key", "OpenSSH / sk / ecdsa public key line",
+     r"(?:(?:sk-)?ssh-ed25519(?:@openssh\.com)?|ssh-rsa|(?:sk-)?ecdsa-sha2-\S+)[ \t]+AAAA[A-Za-z0-9+/=]{8,}\S*", 0, None, None),
+    ("ssh-fingerprint", "SSH key fingerprint SHA256:<43 base64>", r"SHA256:[A-Za-z0-9+/]{43}", 0, None, None),
+    ("aws-access-key-id", "AWS access key id", r"\bAKIA[0-9A-Z]{16}\b", 0, None, None),
+    ("github-token", "GitHub token gh[pousr]_...", r"\bgh[pousr]_[A-Za-z0-9]{36,}", 0, None, None),
+    ("anthropic-openai-key", "sk-ant-, sk-proj-, sk-<32+> API keys",
+     r"\bsk-ant-[A-Za-z0-9_-]{8,}|\bsk-proj-[A-Za-z0-9_-]{8,}|\bsk-[A-Za-z0-9]{32,}", 0, None, None),
+    ("google-api-key", "Google API key AIza...", r"\bAIza[0-9A-Za-z_-]{35}", 0, None, None),
+    ("slack-token", "Slack token xox?-", r"\bxox[baprs]-[A-Za-z0-9-]{6,}", 0, None, None),
+    ("jwt", "JSON web token (eyJ... x3)", r"\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}", 0, None, None),
+    ("generic-secret", "password/secret/token/api key assignment with a non-placeholder value of 8+ chars",
+     r"""(?:password|passwd|secret|token|api[_-]?key)[A-Za-z0-9_-]*["']?\s*[=:]\s*["']?([^\s"']{8,})""",
+     re.I, 1, lambda m: _generic_value_ok(m.group(1))),
+    ("path-ssh", "~/.ssh or an absolute home path to it", r"(?:~|\$\{?HOME\}?|/home/[A-Za-z0-9._-]+|/Users/[A-Za-z0-9._-]+|/root)/\.ssh", 0, None, None),
+    ("path-aws", "~/.aws or an absolute home path to it", r"(?:~|\$\{?HOME\}?|/home/[A-Za-z0-9._-]+|/Users/[A-Za-z0-9._-]+|/root)/\.aws", 0, None, None),
+    ("path-gcloud", "~/.config/gcloud or an absolute home path to it", r"(?:~|\$\{?HOME\}?|/home/[A-Za-z0-9._-]+|/Users/[A-Za-z0-9._-]+|/root)/\.config/gcloud", 0, None, None),
+    ("ipv4-rfc1918", "RFC1918 IPv4 (10/8, 172.16/12, 192.168/16)", IPV4, 0, None,
+     _net_filter("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")),
+    ("ipv4-cgnat-tailscale", "100.64.0.0/10 (CGNAT / Tailscale)", IPV4, 0, None, _net_filter("100.64.0.0/10")),
+    ("ipv4-link-local", "169.254.0.0/16", IPV4, 0, None, _net_filter("169.254.0.0/16")),
+    ("ipv6-tailscale", "fd7a:115c:a1e0: Tailscale IPv6", r"fd7a:115c:a1e0:", re.I, None, None),
+    ("ipv6-ula", "IPv6 unique local fc00::/7",
+     r"(?<![0-9A-Fa-f:])f[cd][0-9a-f]{2}(?::[0-9a-f]{0,4}){2,7}(?![0-9A-Fa-f:])", re.I, None, _ula_ok),
+    ("tailnet-hostname", "*.ts.net hostname", r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.ts\.net\b", re.I, None, None),
+    ("mac-address", "MAC address", r"(?<![0-9A-Fa-f:-])(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}(?![0-9A-Fa-f:-])", 0, None, None),
+]
+
+
+def extra_path():
+    return os.environ.get("LEAKSCAN_EXTRA") or os.path.join(os.path.expanduser("~"), ".config", "leakscan", "extra.txt")
+
+
+def load_extra():
+    """Return list of compiled extra patterns; raises ValueError on a bad regex."""
+    out = []
+    try:
+        with open(extra_path(), encoding="utf-8") as fh:
+            lines = fh.read().split("\n")
+    except FileNotFoundError:
+        return out
+    for i, raw in enumerate(lines, 1):
+        s = raw.strip()
+        if not s or s.startswith("#"):
+            continue
+        try:
+            out.append(("extra:%d" % i, re.compile(s)))
+        except re.error as e:
+            raise ValueError("extra.txt line %d: bad regex (%s)" % (i, e))
+    return out
+
+
+def mask(text, keep_cap=4):
+    n = len(text)
+    k = min(keep_cap, n // 4)
+    return text[:k] + "*" * (n - k)
+
+
+def render(m, grp):
+    if grp is None:
+        return mask(m.group(0))
+    s, e = m.span(grp)
+    a = m.start()
+    t = m.group(0)
+    return t[: s - a] + mask(m.group(grp)) + t[e - a:]
+
+
+def compiled():
+    return [(n, re.compile(rx, fl), g, f) for n, _d, rx, fl, g, f in PATTERNS]
+
+
+def scan_text(text, pats, extra):
+    """Yield (lineno, name, masked, suppressed)."""
+    for ln, line in enumerate(text.split("\n"), 1):
+        line = line.rstrip("\r")
+        allowed = ALLOW in line
+        for name, rx, g, f in pats:
+            for m in rx.finditer(line):
+                if f and not f(m):
+                    continue
+                yield ln, name, render(m, g), allowed
+        for name, rx in extra:
+            for m in rx.finditer(line):
+                if m.group(0) == "":
+                    continue
+                yield ln, name, mask(m.group(0)), allowed
+
+
+def main(argv):
+    args = argv[1:]
+    if args == ["--list-patterns"]:
+        for n, d, *_ in PATTERNS:
+            print("%-22s %s" % (n, d))
+        print("%-22s %s" % ("extra:<line>", "user regexes from %s (not shown)" % extra_path()))
+        return 0
+    if not args or any(a.startswith("-") for a in args):
+        print("usage: leakscan FILE...   |   leakscan --list-patterns", file=sys.stderr)
+        return 2
+    try:
+        extra = load_extra()
+    except (ValueError, OSError, UnicodeDecodeError) as e:
+        print("leakscan: %s" % e, file=sys.stderr)
+        return 2
+    pats = compiled()
+    hits = supp = 0
+    unscannable = 0
+    err = False
+    for path in args:
+        try:
+            if os.path.isdir(path):
+                raise IsADirectoryError("is a directory")
+            if os.path.getsize(path) > MAX_BYTES:
+                raise OSError("larger than 20 MB")
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except OSError as e:
+            print("leakscan: %s: %s" % (path, getattr(e, "strerror", None) or e), file=sys.stderr)
+            err = True
+            continue
+        try:
+            if b"\x00" in data:
+                raise UnicodeDecodeError("utf-8", b"", 0, 1, "NUL")
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            print("leakscan: %s: binary file, cannot be checked (counts as a hit)" % path, file=sys.stderr)
+            unscannable += 1
+            continue
+        for ln, name, shown, allowed in scan_text(text, pats, extra):
+            if allowed:
+                supp += 1
+            else:
+                hits += 1
+                print("%s:%d:%s: %s" % (path, ln, name, shown))
+    print("leakscan: %d hit(s), %d suppressed, %d binary/unchecked, %d file(s)"
+          % (hits, supp, unscannable, len(args)), file=sys.stderr)
+    if err:
+        return 2
+    return 1 if hits or unscannable else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
